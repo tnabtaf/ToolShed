@@ -13,12 +13,14 @@
 #
 
 import argparse
+import base64                             # emails from 2019/05 and after
 import getpass                            #
 import imaplib                            # Email protocol
 import urllib.parse
 import os.path
 import json                               # tool shed respoonses
 import urllib.request
+import ssl
 import re
 
 HOST = "imap.gmail.com"
@@ -26,12 +28,22 @@ HOST = "imap.gmail.com"
 # TOOLSHED_SENDER = "galaxy-no-reply@radegast.galaxyproject.org"   # Sender from 2015/04/22 to 2016/07/23
 TOOLSHED_SENDER = "galaxy-no-reply@toolshed.g2.bx.psu.edu"   # Sender from 2016/07/27 on
 
-HEADER_PARTS = "(BODY.PEEK[HEADER.FIELDS (From Subject)])"
+# ignore issues with Toolshed certificates.
+TS_SSL_CONTEXT = ssl.create_default_context()
+TS_SSL_CONTEXT.check_hostname = False
+TS_SSL_CONTEXT.verify_mode = ssl.CERT_NONE
+
+
+HEADER_PARTS = "(BODY.PEEK[HEADER.FIELDS (Content-Transfer-Encoding From Subject)])"
 BODY_PARTS = "(BODY.PEEK[TEXT])"
 
 # indexes into tuple for each part
-FROM    = 0
-SUBJECT = 1
+ENCODING = 0
+FROM = 1
+SUBJECT = 2
+
+ENCODING_LEADER_LEN = len("Content-Transfer-Encoding: ")
+
 
 LINK_LINE = 1
 REPO_LINE = 2
@@ -73,7 +85,6 @@ class ToolShedRepo:
         self.getToolShedInfo()
         return(None)
 
-    
     def parseEmail(self, headerTxt, bodyTxt):
         """
         Typical header:
@@ -82,6 +93,13 @@ class ToolShedRepo:
              Subject: Galaxy tool shed repository update alert\r\n\r\n'
            ),
            ')']
+          [(b'8033 (UID 8128 BODY[HEADER.FIELDS (Content-Transfer-Encoding From Subject)] {148}',
+            b'Content-Transfer-Encoding: 7bit\r\n
+              From: galaxy-no-reply@toolshed.g2.bx.psu.edu\r\n
+              Subject: Galaxy tool shed alert for new repository named re_utils\r\n\r\n'
+           ),
+           b')']
+
         Typical Body:
           [('3 (UID 3 BODY[TEXT] {678}',
             '\r\n
@@ -124,11 +142,18 @@ class ToolShedRepo:
         _headers = headerTxt[0][1].decode("utf-8").split("\r\n")
         self.sender = _headers[FROM][6:]
         self.subject = _headers[SUBJECT][9:]
+        self.encoding = _headers[ENCODING][ENCODING_LEADER_LEN:]
+
         if self.sender != TOOLSHED_SENDER:
             return None                   # need to raise an error.
 
         # split body into an array of lines of text
-        self.body = bodyTxt[0][1].decode("utf-8").split("\r\n")
+        bodyText = bodyTxt[0][1]
+        if self.encoding == "base64":
+            bodyText = base64.standard_b64decode(bodyText)
+            self.body = bodyText.decode("utf-8").split("\n")
+        else:
+            self.body = bodyText.decode("utf-8").split("\r\n")
 
         # extract repo link, which also contains author url
         self.url = self.body[LINK_LINE].split()[2]
@@ -167,13 +192,14 @@ class ToolShedRepo:
         # https://toolshed.g2.bx.psu.edu/api/repositories/get_repository_revision_install_info?name=mirplant2&owner=big-tiandm&changeset_revision=2cb6add23dfe
         _tsApiUrl = (TOOLSHED_API_ROOT_URL + "repositories/get_repository_revision_install_info?" +
                     "name=" + self.name + "&owner=" + self.author + "&changeset_revision=" + self.revision)
-        response = urllib.request.urlopen(_tsApiUrl).read().decode("utf-8")
+        response = urllib.request.urlopen(_tsApiUrl, context=TS_SSL_CONTEXT).read().decode("utf-8")
         # take out embedded \r's in the text.
         response = response.replace(r"\r", "")
         _tsData = json.loads(response)
         
-        # passe just means we aren't interested.
-        self.passe = _tsData[0]["deleted"] or _tsData[0]["deprecated"] or _tsData[1]["malicious"]
+        # passe just means we aren't interested.  Also returns false if whole
+        # thing is empty
+        self.passe = _tsData[0].get("deleted") or _tsData[0].get("deprecated") or _tsData[1].get("malicious")
         self.synopsis = ""
         self.description = ""
         self.type = "Unknown"
@@ -246,8 +272,8 @@ passe = []
 
 args = Arrgghhss()                        # Command line args
 
-# Establish Email connection, get emails.
 
+# Establish Email connection, get emails.
 email = imaplib.IMAP4_SSL(HOST)
 email.login(args.args.email, getpass.getpass())
 email.select('"' + args.args.mailbox + '"', True)
